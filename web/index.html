@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PE 1.1.5 End Pillar Recorder</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Minecraft Pocket Edition 1.1.5.0</p>
+      <h1>End pillar recorder</h1>
+      <p class="intro">Click a pillar around the portal, select its measured height,
+        then copy an exact local command for <code>pe115_pillarcracker</code>.</p>
+    </header>
+
+    <section class="workspace" aria-label="Pillar recorder">
+      <div class="map-panel">
+        <div class="orientation north" aria-hidden="true">N</div>
+        <div class="orientation east" aria-hidden="true">E</div>
+        <div class="orientation south" aria-hidden="true">S</div>
+        <div class="orientation west" aria-hidden="true">W</div>
+        <div id="ring" class="ring" aria-label="Top-down End portal and ten pillars">
+          <div class="portal" aria-label="End portal">Portal</div>
+        </div>
+        <p class="map-note">Top-down view. Coordinates are the fixed PE 1.1.5
+          pillar centers; north is negative Z.</p>
+      </div>
+
+      <div class="controls-panel">
+        <h2 id="selection-title">Select a pillar</h2>
+        <p id="selection-detail" class="muted">Choose one on the diagram to enter a height.</p>
+
+        <fieldset class="measure-mode">
+          <legend>Measured value</legend>
+          <label><input type="radio" name="measure-mode" value="feature" checked>
+            Feature / crystal-layer Y (76–103)</label>
+          <label><input type="radio" name="measure-mode" value="obsidian">
+            Highest obsidian Y (75–102)</label>
+        </fieldset>
+
+        <div id="height-picker" class="height-picker" aria-label="Height picker"></div>
+
+        <div class="selector">
+          <label for="scan-mode">Seed domain</label>
+          <select id="scan-mode">
+            <option value="all">All 2³² PE world seeds</option>
+            <option value="high16">Known high 16 bits</option>
+            <option value="low16">Known low 16 bits</option>
+            <option value="range">Contiguous seed range</option>
+          </select>
+          <div id="selector-inputs"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="result-panel" aria-live="polite">
+      <div class="completion-row">
+        <strong id="completion">0 / 10 pillars entered</strong>
+        <button id="clear" class="secondary" type="button">Clear heights</button>
+      </div>
+      <p id="validation" class="muted">Enter every distinct pillar height to generate a command.</p>
+      <label for="command">Local PowerShell command</label>
+      <textarea id="command" rows="4" readonly spellcheck="false"></textarea>
+      <button id="copy" type="button" disabled>Copy command</button>
+      <p id="copy-status" class="muted" role="status"></p>
+    </section>
+
+    <section class="reference">
+      <h2>Important</h2>
+      <p>The ten values must be one each of the allowed heights. Pillar layout alone
+        does not recover a unique world seed; the copied command prints every matching
+        32-bit PE seed. This page only builds a local command and performs no network requests.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
