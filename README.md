@@ -1,4 +1,4 @@
-VIBECODED Pocket Edition 1.1.5 end pillar cracker
+VIBECODED Pocket Edition / Bedrock Edition end pillar cracker
 
 ## What it recovers
 
