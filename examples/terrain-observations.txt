@@ -1,0 +1,13 @@
+# PE 1.1.5.0 End base-terrain observations for --terrain-filter.
+# Format: x y z value
+# value 1 = natural End stone; value 0 = natural air.
+#
+# These are sample observations from a development fixture whose seed was
+# 0x9733FC86. They demonstrate format only. Record your own unmodified natural
+# terrain: do not use a pillar, platform, exit portal, entities, or mined/
+# placed blocks.
+
+0 0 0 0
+0 56 0 1
+0 127 0 0
+1000 64 1000 0

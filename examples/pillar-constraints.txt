@@ -1,0 +1,35 @@
+# PE 1.1.5.0 pillar-constraint command examples.
+#
+# These records describe the known fixture world seed 330675023. They are
+# examples of syntax and ring-position mapping, not a required layout for
+# another world. Feature height is the crystal/cage Y level, rather than the
+# highest obsidian Y level.
+
+# Complete layout: all property fields are supplied. With every height known,
+# radius and cage state are consistency checks because PE derives them from
+# the same shuffled shape value.
+.\build\Release\pe115_pillarcracker.exe `
+  --pillar 42,0,97,4,UNCAGED `
+  --pillar 33,24,82,2,CAGED `
+  --pillar 12,39,76,2,UNCAGED `
+  --pillar -12,39,94,4,UNCAGED `
+  --pillar -33,24,79,2,CAGED `
+  --pillar -42,0,85,3,UNCAGED `
+  --pillar -33,-24,103,5,UNCAGED `
+  --pillar -12,-39,100,4,UNCAGED `
+  --pillar 12,-39,91,3,UNCAGED `
+  --pillar 33,-24,88,3,UNCAGED `
+  --all
+
+# Partial constraints are also allowed. Use these when height is unknown:
+.\build\Release\pe115_pillarcracker.exe `
+  --pillar-radius 42,0,4 `
+  --pillar-cage 42,0,UNCAGED `
+  --pillar 33,24,82 `
+  --low16 0xB34F
+
+# If the measured number is the highest obsidian block, use --pillar-top:
+.\build\Release\pe115_pillarcracker.exe `
+  --pillar-top 42,0,96,4,UNCAGED `
+  --pillar-top 33,24,81,2,CAGED `
+  --low16 0xB34F

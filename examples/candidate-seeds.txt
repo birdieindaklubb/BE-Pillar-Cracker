@@ -1,0 +1,3 @@
+# Candidate input accepts unsigned decimal, signed decimal, or 0x hexadecimal.
+# This one candidate matches examples/terrain-observations.txt.
+0x9733FC86
