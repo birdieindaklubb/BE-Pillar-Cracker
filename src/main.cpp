@@ -4,16 +4,24 @@
 // intentionally contains only the MT19937 prefix and shuffle needed to model
 // the observed End-pillar height layout, not a general world generator.
 
+#include "pillar_constraints.hpp"
 #include "avx2.hpp"
+#include "pe115_end_terrain.hpp"
 #ifdef PE115_HAVE_CUDA
 #include "cuda_backend.hpp"
 #endif
+#include "terrain_filter.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -22,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -31,7 +40,7 @@
 
 namespace {
 
-constexpr std::size_t kPillarCount = 10;
+constexpr std::size_t kPillarCount = pe115::kPillarCount;
 constexpr std::size_t kShuffleDrawCount = kPillarCount - 1;
 constexpr std::uint32_t kMtMultiplier = 1'812'433'253U;
 constexpr std::uint32_t kMtUpperMask = 0x8000'0000U;
@@ -49,7 +58,7 @@ constexpr std::array<PillarSite, kPillarCount> kPillarSites{{
     {-42, 0}, {-33, -24}, {-12, -39}, {12, -39}, {33, -24},
 }};
 
-using Observations = std::array<std::optional<std::uint8_t>, kPillarCount>;
+using Observations = pe115::PillarShapeMasks;
 
 enum class ScanKind {
     none,
@@ -60,12 +69,13 @@ enum class ScanKind {
 };
 
 struct Options final {
-    Observations observations{};
+    Observations observations{pe115::unconstrained_pillars()};
     ScanKind scan_kind = ScanKind::none;
     std::uint64_t range_start = 0;
     std::uint64_t range_count = 0;
     std::uint16_t word = 0;
     std::optional<std::uint32_t> verify_seed;
+    std::optional<std::pair<std::string, std::string>> terrain_filter_files;
     unsigned int threads = 0;
     bool scalar = false;
     bool avx2_requested = false;
@@ -147,13 +157,61 @@ enum class SelectedBackend {
     return order;
 }
 
+[[nodiscard]] constexpr std::uint16_t shape_bit(
+    std::uint8_t shape) noexcept {
+    return static_cast<std::uint16_t>(1U << shape);
+}
+
+[[nodiscard]] constexpr bool is_single_shape(
+    std::uint16_t mask) noexcept {
+    return mask != 0U && (mask & static_cast<std::uint16_t>(mask - 1U)) == 0U;
+}
+
+[[nodiscard]] std::uint8_t shape_from_mask(std::uint16_t mask) noexcept {
+    for (std::uint8_t shape = 0U; shape < kPillarCount; ++shape) {
+        if (mask == shape_bit(shape)) {
+            return shape;
+        }
+    }
+    return 0U;
+}
+
+[[nodiscard]] constexpr std::uint8_t shape_radius(
+    std::uint8_t shape) noexcept {
+    return static_cast<std::uint8_t>(shape / 3U + 2U);
+}
+
+[[nodiscard]] constexpr bool shape_is_caged(
+    std::uint8_t shape) noexcept {
+    return shape == 1U || shape == 2U;
+}
+
+[[nodiscard]] std::uint16_t radius_mask(std::int32_t radius) {
+    if (radius < 2 || radius > 5) {
+        throw std::runtime_error("Pillar radius must be 2, 3, 4, or 5.");
+    }
+    std::uint16_t result = 0U;
+    for (std::uint8_t shape = 0U; shape < kPillarCount; ++shape) {
+        if (shape_radius(shape) == radius) {
+            result = static_cast<std::uint16_t>(result | shape_bit(shape));
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] constexpr std::uint16_t cage_mask(bool caged) noexcept {
+    constexpr std::uint16_t caged_shapes = shape_bit(1U) | shape_bit(2U);
+    return caged ? caged_shapes
+                 : static_cast<std::uint16_t>(
+                       pe115::kAllPillarShapes & ~caged_shapes);
+}
+
 [[nodiscard]] bool matches(
     std::uint32_t seed,
     const Observations& observations) noexcept {
     const auto shapes = pillar_shapes(seed);
     for (std::size_t index = 0; index < shapes.size(); ++index) {
-        if (observations[index].has_value()
-            && *observations[index] != shapes[index]) {
+        if ((observations[index] & shape_bit(shapes[index])) == 0U) {
             return false;
         }
     }
@@ -170,11 +228,11 @@ using DrawConstraints = std::array<std::uint8_t, kShuffleDrawCount>;
     const Observations& observations) {
     std::array<std::uint8_t, kPillarCount> order{};
     for (std::size_t index = 0; index < order.size(); ++index) {
-        if (!observations[index].has_value()) {
+        if (!is_single_shape(observations[index])) {
             throw std::runtime_error("Cannot derive shuffle constraints from "
-                "an incomplete height list.");
+                "a partially constrained pillar layout.");
         }
-        order[index] = *observations[index];
+        order[index] = shape_from_mask(observations[index]);
     }
 
     DrawConstraints result{};
@@ -293,15 +351,18 @@ using DrawConstraints = std::array<std::uint8_t, kShuffleDrawCount>;
     return static_cast<std::uint8_t>(shifted / kHeightStep);
 }
 
-void set_observation(
+void add_constraint(
     Observations& observations,
     std::size_t index,
-    std::uint8_t shape) {
-    if (observations[index].has_value() && *observations[index] != shape) {
-        throw std::runtime_error("Conflicting heights supplied for pillar index "
-            + std::to_string(index) + ".");
+    std::uint16_t allowed_shapes,
+    std::string_view label) {
+    const std::uint16_t combined = static_cast<std::uint16_t>(
+        observations[index] & allowed_shapes);
+    if (combined == 0U) {
+        throw std::runtime_error("Conflicting " + std::string(label)
+            + " supplied for pillar index " + std::to_string(index) + ".");
     }
-    observations[index] = shape;
+    observations[index] = combined;
 }
 
 void set_heights(
@@ -316,56 +377,140 @@ void set_heights(
     for (std::size_t index = 0; index < fields.size(); ++index) {
         const std::int32_t measured = parse_i32(fields[index], "height");
         const std::int32_t feature_height = obsidian_tops ? measured + 1 : measured;
-        set_observation(
+        add_constraint(
             observations,
             index,
-            feature_height_to_shape(feature_height, "Pillar height"));
+            shape_bit(feature_height_to_shape(feature_height, "Pillar height")),
+            "height");
     }
 }
 
-void set_pillar(
-    Observations& observations,
-    std::string_view csv) {
-    const auto fields = split_csv(csv);
-    if (fields.size() != 3) {
-        throw std::runtime_error("--pillar must have the form X,Z,HEIGHT.");
-    }
-    const std::int32_t x = parse_i32(fields[0], "pillar X");
-    const std::int32_t z = parse_i32(fields[1], "pillar Z");
-    const std::int32_t height = parse_i32(fields[2], "pillar height");
-
+[[nodiscard]] std::size_t pillar_index(
+    std::int32_t x,
+    std::int32_t z) {
     for (std::size_t index = 0; index < kPillarSites.size(); ++index) {
         if (kPillarSites[index].x == x && kPillarSites[index].z == z) {
-            set_observation(
-                observations,
-                index,
-                feature_height_to_shape(height, "Pillar height"));
-            return;
+            return index;
         }
     }
     throw std::runtime_error("The supplied pillar coordinate is not a PE 1.1.5 "
         "End ring center.");
 }
 
+[[nodiscard]] bool parse_caged(
+    std::string_view text) {
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (const unsigned char character : text) {
+        normalized.push_back(static_cast<char>(std::tolower(character)));
+    }
+    if (normalized == "caged" || normalized == "cage"
+        || normalized == "yes" || normalized == "true" || normalized == "1") {
+        return true;
+    }
+    if (normalized == "uncaged" || normalized == "no-cage"
+        || normalized == "no" || normalized == "false" || normalized == "0") {
+        return false;
+    }
+    throw std::runtime_error("Pillar cage must be CAGED or UNCAGED.");
+}
+
+void add_radius_constraint(
+    Observations& observations,
+    std::size_t index,
+    std::int32_t radius) {
+    add_constraint(observations, index, radius_mask(radius), "radius");
+}
+
+void add_cage_constraint(
+    Observations& observations,
+    std::size_t index,
+    bool caged) {
+    add_constraint(observations, index, cage_mask(caged), "cage state");
+}
+
+void set_pillar(
+    Observations& observations,
+    std::string_view csv,
+    bool obsidian_tops) {
+    const auto fields = split_csv(csv);
+    if (fields.size() < 3U || fields.size() > 5U) {
+        throw std::runtime_error("--pillar must have the form "
+            "X,Z,HEIGHT[,RADIUS[,CAGED|UNCAGED]].");
+    }
+    const std::int32_t x = parse_i32(fields[0], "pillar X");
+    const std::int32_t z = parse_i32(fields[1], "pillar Z");
+    const std::int32_t measured_height = parse_i32(fields[2], "pillar height");
+    if (obsidian_tops && measured_height == std::numeric_limits<std::int32_t>::max()) {
+        throw std::runtime_error("Pillar top is out of range.");
+    }
+    const std::int32_t feature_height = obsidian_tops
+        ? measured_height + 1
+        : measured_height;
+    const std::size_t index = pillar_index(x, z);
+    add_constraint(observations, index,
+        shape_bit(feature_height_to_shape(feature_height, "Pillar height")), "height");
+    if (fields.size() >= 4U) {
+        add_radius_constraint(
+            observations, index, parse_i32(fields[3], "pillar radius"));
+    }
+    if (fields.size() == 5U) {
+        add_cage_constraint(observations, index, parse_caged(fields[4]));
+    }
+}
+
+void set_pillar_radius(
+    Observations& observations,
+    std::string_view csv) {
+    const auto fields = split_csv(csv);
+    if (fields.size() != 3U) {
+        throw std::runtime_error("--pillar-radius must have the form X,Z,RADIUS.");
+    }
+    const std::size_t index = pillar_index(
+        parse_i32(fields[0], "pillar X"), parse_i32(fields[1], "pillar Z"));
+    add_radius_constraint(
+        observations, index, parse_i32(fields[2], "pillar radius"));
+}
+
+void set_pillar_cage(
+    Observations& observations,
+    std::string_view csv) {
+    const auto fields = split_csv(csv);
+    if (fields.size() != 3U) {
+        throw std::runtime_error("--pillar-cage must have the form "
+            "X,Z,CAGED|UNCAGED.");
+    }
+    const std::size_t index = pillar_index(
+        parse_i32(fields[0], "pillar X"), parse_i32(fields[1], "pillar Z"));
+    add_cage_constraint(observations, index, parse_caged(fields[2]));
+}
+
 [[nodiscard]] std::size_t observation_count(
     const Observations& observations) noexcept {
     return static_cast<std::size_t>(std::count_if(
         observations.begin(), observations.end(),
-        [](const auto& value) { return value.has_value(); }));
+        [](std::uint16_t value) { return value != pe115::kAllPillarShapes; }));
 }
 
 void validate_unique_shapes(const Observations& observations) {
     std::array<bool, kPillarCount> used{};
-    for (const auto shape : observations) {
-        if (!shape.has_value()) {
+    for (const std::uint16_t mask : observations) {
+        if (!is_single_shape(mask)) {
             continue;
         }
-        if (used[*shape]) {
-            throw std::runtime_error("Each measured pillar height must be unique. "
-                "The ten PE pillar heights form one permutation.");
+        const std::uint8_t shape = shape_from_mask(mask);
+        if (used[shape]) {
+            throw std::runtime_error("Each exact pillar-shape constraint must "
+                "be unique. The ten PE pillar shapes form one permutation.");
         }
-        used[*shape] = true;
+        used[shape] = true;
     }
+}
+
+[[nodiscard]] bool is_complete_permutation(
+    const Observations& observations) noexcept {
+    return std::all_of(observations.begin(), observations.end(),
+        [](std::uint16_t mask) { return is_single_shape(mask); });
 }
 
 [[nodiscard]] std::string next_argument(
@@ -394,6 +539,15 @@ void validate_unique_shapes(const Observations& observations) {
                 next_argument(index, argc, argv, argument), true);
         } else if (argument == "--pillar") {
             set_pillar(options.observations,
+                next_argument(index, argc, argv, argument), false);
+        } else if (argument == "--pillar-top") {
+            set_pillar(options.observations,
+                next_argument(index, argc, argv, argument), true);
+        } else if (argument == "--pillar-radius") {
+            set_pillar_radius(options.observations,
+                next_argument(index, argc, argv, argument));
+        } else if (argument == "--pillar-cage") {
+            set_pillar_cage(options.observations,
                 next_argument(index, argc, argv, argument));
         } else if (argument == "--high16") {
             if (options.scan_kind != ScanKind::none) {
@@ -435,6 +589,14 @@ void validate_unique_shapes(const Observations& observations) {
             }
             options.verify_seed = static_cast<std::uint32_t>(parse_unsigned(
                 next_argument(index, argc, argv, argument), 0xffff'ffffULL, "seed"));
+        } else if (argument == "--terrain-filter") {
+            if (options.terrain_filter_files.has_value()) {
+                throw std::runtime_error("--terrain-filter was provided twice.");
+            }
+            const std::string candidates = next_argument(
+                index, argc, argv, argument);
+            const std::string terrain = next_argument(index, argc, argv, argument);
+            options.terrain_filter_files = {candidates, terrain};
         } else if (argument == "--threads") {
             const auto requested = parse_unsigned(next_argument(
                 index, argc, argv, argument),
@@ -461,6 +623,10 @@ void validate_unique_shapes(const Observations& observations) {
                    "--range-start START --count COUNT\n"
                 << "  pe115_pillarcracker --heights H0,...,H9 --all\n"
                 << "  pe115_pillarcracker --verify SEED [--heights H0,...,H9]\n\n"
+                << "  --pillar X,Z,H[,R[,CAGED|UNCAGED]]\n"
+                << "  --pillar-top X,Z,TOP[,R[,CAGED|UNCAGED]]\n"
+                << "  --pillar-radius X,Z,R  --pillar-cage X,Z,CAGED|UNCAGED\n\n"
+                << "  pe115_pillarcracker --terrain-filter CANDIDATES.txt TERRAIN.txt\n\n"
                 << "Heights are feature/crystal-layer Y values 76..103 in steps "
                    "of 3.  --cuda/--avx2 require those backends; --scalar "
                    "disables them.  "
@@ -534,14 +700,18 @@ void print_layout(std::uint32_t seed) {
     std::cout << "Seed " << seed << " (signed "
               << static_cast<std::int32_t>(seed) << ", "
               << hex_value(seed, 8) << ")\n";
-    std::cout << "index  center       feature-height  top-obsidian\n";
+    std::cout << "index  center       feature-height  top-obsidian  radius  cage\n";
     for (std::size_t index = 0; index < kPillarCount; ++index) {
         const std::int32_t height = 76 + 3 * static_cast<std::int32_t>(shapes[index]);
         std::cout << std::setw(5) << index << "  ("
                   << std::setw(3) << kPillarSites[index].x << ","
                   << std::setw(3) << kPillarSites[index].z << ")"
                   << std::setw(12) << height
-                  << std::setw(14) << height - 1 << "\n";
+                  << std::setw(14) << height - 1
+                  << std::setw(8) << static_cast<int>(shape_radius(shapes[index]))
+                  << std::setw(7)
+                  << (shape_is_caged(shapes[index]) ? "caged" : "none")
+                  << "\n";
     }
 }
 
@@ -557,10 +727,10 @@ void print_layout(std::uint32_t seed) {
     }
 
     constexpr std::uint32_t test_seed = 0x1234'5678U;
-    Observations observation{};
+    Observations observation{pe115::unconstrained_pillars()};
     const auto shapes = pillar_shapes(test_seed);
     for (std::size_t index = 0; index < shapes.size(); ++index) {
-        observation[index] = shapes[index];
+        observation[index] = shape_bit(shapes[index]);
     }
     if (!matches(test_seed, observation)) {
         std::cerr << "Self-test failed: matching layout rejected.\n";
@@ -571,9 +741,21 @@ void print_layout(std::uint32_t seed) {
         std::cerr << "Self-test failed: inverted shuffle constraints rejected.\n";
         return false;
     }
-    observation[0] = static_cast<std::uint8_t>((shapes[0] + 1U) % kPillarCount);
+    observation[0] = shape_bit(static_cast<std::uint8_t>(
+        (shapes[0] + 1U) % kPillarCount));
     if (matches(test_seed, observation)) {
         std::cerr << "Self-test failed: altered layout accepted.\n";
+        return false;
+    }
+    Observations feature_observation{pe115::unconstrained_pillars()};
+    for (std::size_t index = 0; index < shapes.size(); ++index) {
+        add_radius_constraint(feature_observation, index,
+            shape_radius(shapes[index]));
+        add_cage_constraint(feature_observation, index,
+            shape_is_caged(shapes[index]));
+    }
+    if (!matches(test_seed, feature_observation)) {
+        std::cerr << "Self-test failed: native radius/cage layout rejected.\n";
         return false;
     }
     std::cout << "Self-test passed: standard MT19937 prefix and PE pillar "
@@ -721,18 +903,158 @@ void print_layout(std::uint32_t seed) {
     return candidates;
 }
 
-void print_candidates(const std::vector<std::uint32_t>& candidates) {
-    std::cout << "Matching full PE 1.1.5 world seeds: " << candidates.size()
-              << "\n";
+[[nodiscard]] std::vector<std::uint32_t> scan(
+    const Options& options,
+    const Observations& observations,
+    SelectedBackend backend) {
+    const std::uint64_t total = scan_count(options);
+    std::vector<std::uint32_t> candidates;
+
+#ifdef _OPENMP
+    omp_set_num_threads(static_cast<int>(options.threads));
+#endif
+
+#ifdef PE115_HAVE_CUDA
+    if (backend == SelectedBackend::cuda) {
+        candidates = pe115::cuda_backend::scan(
+            avx2_specification(options), observations);
+        std::sort(candidates.begin(), candidates.end());
+        return candidates;
+    }
+#endif
+
+#ifdef PE115_HAVE_AVX2
+    if (backend == SelectedBackend::avx2) {
+        candidates = pe115::avx2::scan(
+            avx2_specification(options), observations);
+        std::sort(candidates.begin(), candidates.end());
+        return candidates;
+    }
+#endif
+
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+        std::vector<std::uint32_t> local_candidates;
+#pragma omp for schedule(static)
+        for (long long index = 0; index < static_cast<long long>(total); ++index) {
+            const std::uint32_t seed = seed_at(
+                options, static_cast<std::uint64_t>(index));
+            if (matches(seed, observations)) {
+                local_candidates.push_back(seed);
+            }
+        }
+#pragma omp critical
+        candidates.insert(
+            candidates.end(), local_candidates.begin(), local_candidates.end());
+    }
+#else
+    for (std::uint64_t index = 0; index < total; ++index) {
+        const std::uint32_t seed = seed_at(options, index);
+        if (matches(seed, observations)) {
+            candidates.push_back(seed);
+        }
+    }
+#endif
+
+    std::sort(candidates.begin(), candidates.end());
+    return candidates;
+}
+
+void write_candidates(
+    std::ostream& output,
+    const std::vector<std::uint32_t>& candidates) {
+    output << "Matching full PE 1.1.5 world seeds: " << candidates.size()
+           << "\n";
     for (const std::uint32_t seed : candidates) {
         const std::uint16_t high = static_cast<std::uint16_t>(seed >> 16U);
         const std::uint16_t low = static_cast<std::uint16_t>(seed);
-        std::cout << "  unsigned=" << seed
-                  << "  signed=" << static_cast<std::int32_t>(seed)
-                  << "  hex=" << hex_value(seed, 8)
-                  << "  high16=" << hex_value(high, 4)
-                  << "  low16=" << hex_value(low, 4) << "\n";
+        output << "  unsigned=" << seed
+               << "  signed=" << static_cast<std::int32_t>(seed)
+               << "  hex=" << hex_value(seed, 8)
+               << "  high16=" << hex_value(high, 4)
+               << "  low16=" << hex_value(low, 4) << "\n";
     }
+}
+
+void print_candidates(const std::vector<std::uint32_t>& candidates) {
+    write_candidates(std::cout, candidates);
+}
+
+[[nodiscard]] std::filesystem::path save_candidates(
+    const std::vector<std::uint32_t>& candidates,
+    std::string_view source) {
+    namespace fs = std::filesystem;
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t calendar = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+#ifdef _WIN32
+    if (localtime_s(&local_time, &calendar) != 0) {
+        throw std::runtime_error("Cannot read the local machine time.");
+    }
+#else
+    if (localtime_r(&calendar, &local_time) == nullptr) {
+        throw std::runtime_error("Cannot read the local machine time.");
+    }
+#endif
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    const auto milliseconds = static_cast<unsigned int>(
+        (elapsed % 1000LL + 1000LL) % 1000LL);
+
+    std::ostringstream id;
+    id << std::put_time(&local_time, "%y%m%d-%H%M%S")
+       << '-' << std::setfill('0') << std::setw(3) << milliseconds;
+    const fs::path directory{"results"};
+    std::error_code error;
+    if (!fs::create_directories(directory, error) && error) {
+        throw std::runtime_error("Cannot create results directory: "
+            + error.message());
+    }
+
+    for (unsigned int collision = 0U; collision < 10'000U; ++collision) {
+        std::ostringstream filename;
+        filename << "pe115-" << id.str();
+        if (collision != 0U) {
+            filename << '-' << std::setw(2) << std::setfill('0') << collision;
+        }
+        filename << ".txt";
+        const fs::path path = directory / filename.str();
+        if (fs::exists(path, error)) {
+            if (error) {
+                throw std::runtime_error("Cannot inspect results directory: "
+                    + error.message());
+            }
+            continue;
+        }
+        if (error) {
+            throw std::runtime_error("Cannot inspect results directory: "
+                + error.message());
+        }
+
+        std::ofstream output(path, std::ios::out | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Cannot create result file: "
+                + path.string());
+        }
+        output << "# PE 1.1.5 End pillar cracker " << source << " result\n"
+               << "# Local time id: " << id.str() << "\n";
+        write_candidates(output, candidates);
+        if (!output) {
+            throw std::runtime_error("Cannot write result file: "
+                + path.string());
+        }
+        return path;
+    }
+    throw std::runtime_error("Could not allocate a unique result-file name.");
+}
+
+void print_and_save_candidates(
+    const std::vector<std::uint32_t>& candidates,
+    std::string_view source) {
+    print_candidates(candidates);
+    const std::filesystem::path path = save_candidates(candidates, source);
+    std::cout << "Saved candidate list: " << path.string() << "\n";
 }
 
 } // namespace
@@ -740,8 +1062,35 @@ void print_candidates(const std::vector<std::uint32_t>& candidates) {
 int main(int argc, char* argv[]) {
     try {
         Options options = parse_options(argc, argv);
-        if (options.self_test && !self_test()) {
-            return EXIT_FAILURE;
+        if (options.terrain_filter_files.has_value()) {
+            if (options.scan_kind != ScanKind::none
+                || options.verify_seed.has_value()
+                || options.self_test
+                || options.scalar
+                || options.avx2_requested
+                || options.cuda_requested
+                || observation_count(options.observations) != 0U) {
+                throw std::runtime_error("--terrain-filter cannot be combined "
+                    "with pillar scanning, --verify, --self-test, or a "
+                    "scanner-backend selector.");
+            }
+            const auto& [candidate_path, terrain_path] =
+                *options.terrain_filter_files;
+            const auto candidates = pe115::terrain_filter::filter_files(
+                candidate_path, terrain_path, options.threads);
+            std::cout << "Exact PE 1.1.5 End base-terrain filter complete.\n";
+            print_and_save_candidates(candidates, "terrain-filter");
+            return EXIT_SUCCESS;
+        }
+        if (options.self_test) {
+            if (!self_test()) {
+                return EXIT_FAILURE;
+            }
+            if (!pe115::end_terrain::self_test()) {
+                std::cerr << "Self-test failed: PE 1.1.5 End terrain regression.\n";
+                return EXIT_FAILURE;
+            }
+            std::cout << "Self-test passed: PE 1.1.5 End terrain regressions succeeded.\n";
         }
 
         validate_unique_shapes(options.observations);
@@ -764,11 +1113,12 @@ int main(int argc, char* argv[]) {
             return EXIT_SUCCESS;
         }
 
-        if (observation_count(options.observations) != kPillarCount) {
-            throw std::runtime_error("Scanning requires all ten pillar heights. "
-                "Use --verify to inspect a partial observation.");
+        if (observation_count(options.observations) == 0U) {
+            throw std::runtime_error("Scanning needs at least one pillar height, "
+                "radius, or cage observation.");
         }
-        const DrawConstraints draws = derive_draws(options.observations);
+        const bool complete_permutation = is_complete_permutation(
+            options.observations);
 
         if (options.threads == 0U) {
             options.threads = std::max(1U, std::thread::hardware_concurrency());
@@ -792,7 +1142,19 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Using the " << backend_label(backend)
                   << " scanner.\n";
-        print_candidates(scan(options, draws, backend));
+        if (complete_permutation) {
+            // A fully resolved shape order retains the inverse-shuffle fast
+            // path. Radius/cage observations are already intersected into the
+            // same masks and thus validated without altering the algorithm.
+            const auto candidates = scan(
+                options, derive_draws(options.observations), backend);
+            print_and_save_candidates(candidates, "pillar-scan");
+        } else {
+            std::cout << "Using exact partial pillar constraints; the complete "
+                         "shape shuffle is evaluated for every seed.\n";
+            const auto candidates = scan(options, options.observations, backend);
+            print_and_save_candidates(candidates, "pillar-scan");
+        }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << "\nUse --help for usage.\n";

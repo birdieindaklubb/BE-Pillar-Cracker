@@ -4,14 +4,19 @@ project(pe115_pillarcracker LANGUAGES CXX)
 
 add_executable(pe115_pillarcracker
     src/main.cpp
+    src/pe115_end_terrain.cpp
+    src/terrain_filter.cpp
 )
 
 target_compile_features(pe115_pillarcracker PRIVATE cxx_std_20)
 
 if(MSVC)
-    target_compile_options(pe115_pillarcracker PRIVATE /W4 /permissive-)
+    # PE 1.1.5's ARM VFP code uses separately rounded binary32 operations.
+    # Fusing or fast-math can change End-stone decisions at density boundaries.
+    target_compile_options(pe115_pillarcracker PRIVATE /W4 /permissive- /fp:strict)
 else()
-    target_compile_options(pe115_pillarcracker PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(pe115_pillarcracker PRIVATE
+        -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
 endif()
 
 # Keep AVX2 code in a separate translation unit.  The executable dispatches to

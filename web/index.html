@@ -11,8 +11,9 @@
     <header>
       <p class="eyebrow">Minecraft Pocket Edition 1.1.5.0</p>
       <h1>End pillar recorder</h1>
-      <p class="intro">Click a pillar around the portal, select its measured height,
-        then copy an exact local command for <code>pe115_pillarcracker</code>.</p>
+      <p class="intro">Click a pillar around the portal and record any known
+        height, radius, or cage state, then copy an exact local command for
+        <code>pe115_pillarcracker</code>.</p>
     </header>
 
     <section class="workspace" aria-label="Pillar recorder">
@@ -30,7 +31,7 @@
 
       <div class="controls-panel">
         <h2 id="selection-title">Select a pillar</h2>
-        <p id="selection-detail" class="muted">Choose one on the diagram to enter a height.</p>
+        <p id="selection-detail" class="muted">Choose one on the diagram to enter an observation.</p>
 
         <fieldset class="measure-mode">
           <legend>Measured value</legend>
@@ -40,7 +41,12 @@
             Highest obsidian Y (75–102)</label>
         </fieldset>
 
-        <div id="height-picker" class="height-picker" aria-label="Height picker"></div>
+        <h3>Height (optional)</h3>
+        <div id="height-picker" class="constraint-picker height-picker" aria-label="Height picker"></div>
+        <h3>Radius (optional)</h3>
+        <div id="radius-picker" class="constraint-picker" aria-label="Radius picker"></div>
+        <h3>Crystal cage (optional)</h3>
+        <div id="cage-picker" class="constraint-picker" aria-label="Cage picker"></div>
 
         <div class="selector">
           <label for="scan-mode">Seed domain</label>
@@ -57,10 +63,10 @@
 
     <section class="result-panel" aria-live="polite">
       <div class="completion-row">
-        <strong id="completion">0 / 10 pillars entered</strong>
-        <button id="clear" class="secondary" type="button">Clear heights</button>
+        <strong id="completion">0 / 10 pillars constrained · 0 direct heights</strong>
+        <button id="clear" class="secondary" type="button">Clear observations</button>
       </div>
-      <p id="validation" class="muted">Enter every distinct pillar height to generate a command.</p>
+      <p id="validation" class="muted">Record at least one observation to generate a command; stronger layouts produce fewer candidates.</p>
       <label for="command">Local PowerShell command</label>
       <textarea id="command" rows="4" readonly spellcheck="false"></textarea>
       <button id="copy" type="button" disabled>Copy command</button>
@@ -69,9 +75,11 @@
 
     <section class="reference">
       <h2>Important</h2>
-      <p>The ten values must be one each of the allowed heights. Pillar layout alone
-        does not recover a unique world seed; the copied command prints every matching
-        32-bit PE seed. This page only builds a local command and performs no network requests.</p>
+      <p>Each native pillar shape fixes its height, radius, and cage state: radii are
+        2–5, and only two radius-2 shapes are caged. You can use any combination of
+        these fields per pillar. Heights are strongest; partial radius/cage layouts may
+        still produce many full seeds. This page only builds a local command and makes
+        no network requests.</p>
     </section>
   </main>
 

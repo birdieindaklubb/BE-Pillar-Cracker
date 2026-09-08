@@ -18,4 +18,9 @@ namespace pe115::cuda_backend {
     const avx2::ScanSpec& specification,
     const std::array<std::uint8_t, 9>& draws);
 
+// Exact general-layout path for partial height, radius, and cage constraints.
+[[nodiscard]] std::vector<std::uint32_t> scan(
+    const avx2::ScanSpec& specification,
+    const PillarShapeMasks& allowed_shapes);
+
 } // namespace pe115::cuda_backend

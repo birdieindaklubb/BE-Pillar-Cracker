@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pillar_constraints.hpp"
+
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -29,5 +31,11 @@ struct ScanSpec final {
 [[nodiscard]] std::vector<std::uint32_t> scan(
     const ScanSpec& specification,
     const std::array<std::uint8_t, 9>& draws);
+
+// Exact general-layout path for partial height, radius, and cage constraints.
+// Each bit in allowed_shapes[i] denotes a permitted native shape at ring i.
+[[nodiscard]] std::vector<std::uint32_t> scan(
+    const ScanSpec& specification,
+    const PillarShapeMasks& allowed_shapes);
 
 } // namespace pe115::avx2

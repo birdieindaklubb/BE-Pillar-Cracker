@@ -148,6 +148,81 @@ constexpr std::size_t kLaneCount = 8;
     return viable;
 }
 
+[[nodiscard]] std::uint8_t matches_eight(
+    const std::array<std::uint32_t, kLaneCount>& seeds,
+    const PillarShapeMasks& allowed_shapes) noexcept {
+    const __m256i seed_values = _mm256_setr_epi32(
+        static_cast<std::int32_t>(seeds[0]), static_cast<std::int32_t>(seeds[1]),
+        static_cast<std::int32_t>(seeds[2]), static_cast<std::int32_t>(seeds[3]),
+        static_cast<std::int32_t>(seeds[4]), static_cast<std::int32_t>(seeds[5]),
+        static_cast<std::int32_t>(seeds[6]), static_cast<std::int32_t>(seeds[7]));
+
+    std::array<__m256i, 10> initial_low{};
+    initial_low[0] = seed_values;
+    __m256i high_state = seed_values;
+    for (std::uint32_t index = 1; index <= 397U; ++index) {
+        high_state = seed_step(high_state, index);
+        if (index < initial_low.size()) {
+            initial_low[index] = high_state;
+        }
+    }
+
+    const __m256i upper_mask = _mm256_set1_epi32(
+        static_cast<std::int32_t>(kMtUpperMask));
+    const __m256i lower_mask = _mm256_set1_epi32(
+        static_cast<std::int32_t>(kMtLowerMask));
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i matrix_a = _mm256_set1_epi32(
+        static_cast<std::int32_t>(kMtMatrixA));
+    alignas(32) std::array<std::array<std::uint32_t, kLaneCount>, 9>
+        random_values{};
+
+    for (std::size_t index = 0; index < random_values.size(); ++index) {
+        const __m256i joined = _mm256_or_si256(
+            _mm256_and_si256(initial_low[index], upper_mask),
+            _mm256_and_si256(initial_low[index + 1U], lower_mask));
+        const __m256i odd_mask = _mm256_cmpeq_epi32(
+            _mm256_and_si256(joined, one), one);
+        const __m256i twisted = _mm256_xor_si256(
+            _mm256_xor_si256(high_state, _mm256_srli_epi32(joined, 1)),
+            _mm256_and_si256(odd_mask, matrix_a));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(
+            random_values[index].data()), temper(twisted));
+        if (index + 1U != random_values.size()) {
+            high_state = seed_step(
+                high_state, static_cast<std::uint32_t>(398U + index));
+        }
+    }
+
+    std::uint8_t viable = 0U;
+    for (std::size_t lane = 0; lane < kLaneCount; ++lane) {
+        std::array<std::uint8_t, kPillarCount> order{};
+        for (std::uint8_t shape = 0U; shape < kPillarCount; ++shape) {
+            order[shape] = shape;
+        }
+        for (std::size_t index = 1; index < order.size(); ++index) {
+            const std::size_t selected = random_values[index - 1U][lane]
+                % static_cast<std::uint32_t>(index + 1U);
+            const std::uint8_t replacement = order[selected];
+            order[selected] = order[index];
+            order[index] = replacement;
+        }
+        bool matches = true;
+        for (std::size_t index = 0; index < order.size(); ++index) {
+            const std::uint16_t shape_bit = static_cast<std::uint16_t>(
+                1U << order[index]);
+            if ((allowed_shapes[index] & shape_bit) == 0U) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) {
+            viable = static_cast<std::uint8_t>(viable | (1U << lane));
+        }
+    }
+    return viable;
+}
+
 } // namespace
 
 bool is_available() noexcept {
@@ -215,6 +290,56 @@ std::vector<std::uint32_t> scan(
             seeds[lane] = seed_at(specification, base + lane);
         }
         const std::uint8_t viable = matches_eight(seeds, draws);
+        for (std::size_t lane = 0; lane < kLaneCount; ++lane) {
+            if ((viable & static_cast<std::uint8_t>(1U << lane)) != 0U
+                && base + lane < specification.count) {
+                candidates.push_back(seeds[lane]);
+            }
+        }
+    }
+#endif
+    return candidates;
+}
+
+std::vector<std::uint32_t> scan(
+    const ScanSpec& specification,
+    const PillarShapeMasks& allowed_shapes) {
+    std::vector<std::uint32_t> candidates;
+    const auto total = static_cast<long long>(specification.count);
+
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+        std::vector<std::uint32_t> local_candidates;
+        local_candidates.reserve(64U);
+#pragma omp for schedule(static)
+        for (long long base = 0; base < total;
+             base += static_cast<long long>(kLaneCount)) {
+            std::array<std::uint32_t, kLaneCount> seeds{};
+            for (std::size_t lane = 0; lane < seeds.size(); ++lane) {
+                seeds[lane] = seed_at(
+                    specification, static_cast<std::uint64_t>(base) + lane);
+            }
+            const std::uint8_t viable = matches_eight(seeds, allowed_shapes);
+            for (std::size_t lane = 0; lane < kLaneCount; ++lane) {
+                if ((viable & static_cast<std::uint8_t>(1U << lane)) != 0U
+                    && static_cast<std::uint64_t>(base) + lane
+                        < specification.count) {
+                    local_candidates.push_back(seeds[lane]);
+                }
+            }
+        }
+#pragma omp critical
+        candidates.insert(
+            candidates.end(), local_candidates.begin(), local_candidates.end());
+    }
+#else
+    for (std::uint64_t base = 0; base < specification.count; base += kLaneCount) {
+        std::array<std::uint32_t, kLaneCount> seeds{};
+        for (std::size_t lane = 0; lane < seeds.size(); ++lane) {
+            seeds[lane] = seed_at(specification, base + lane);
+        }
+        const std::uint8_t viable = matches_eight(seeds, allowed_shapes);
         for (std::size_t lane = 0; lane < kLaneCount; ++lane) {
             if ((viable & static_cast<std::uint8_t>(1U << lane)) != 0U
                 && base + lane < specification.count) {
