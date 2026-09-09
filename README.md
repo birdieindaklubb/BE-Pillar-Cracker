@@ -1,5 +1,7 @@
 VIBECODED Pocket Edition / Bedrock Edition end pillar cracker
 
+Terrain filter inaccurate until further notice
+
 It searches the 32-bit PE/BE world-seed space from End
 pillar heights, radii, and crystal-cage observations, then can apply exact
 base-End-terrain observations to the resulting candidates.
