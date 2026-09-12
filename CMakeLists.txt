@@ -6,6 +6,7 @@ add_executable(pe115_pillarcracker
     src/main.cpp
     src/pe115_end_terrain.cpp
     src/terrain_filter.cpp
+    src/pillar_layout.cpp
 )
 
 target_compile_features(pe115_pillarcracker PRIVATE cxx_std_20)
