@@ -1,7 +1,7 @@
-// Exact second-stage filter for PE 1.1.5 End base terrain.
+// Exact second-stage filter for the seed-driven, fresh PE 1.1.5 End terrain.
 //
 // This uses the cracker's intentionally narrow, self-contained PE 1.1.5 End
-// base-terrain implementation.  It does not link a wider worldgen library.
+// terrain implementation.  It does not link a wider worldgen library.
 
 #include "terrain_filter.hpp"
 
@@ -35,7 +35,9 @@ constexpr std::int32_t kChunkWidth = 16;
 constexpr std::int32_t kChunkHeight = 128;
 
 struct Observation final {
+    std::int32_t x{};
     std::int32_t y{};
+    std::int32_t z{};
     bool end_stone{};
     std::int32_t chunk_x{};
     std::int32_t chunk_z{};
@@ -130,7 +132,7 @@ struct Observation final {
         } else if (view.starts_with("Scanning ")
             || view.starts_with("Using the ")
             || view.starts_with("Matching full PE 1.1.5 world seeds:")
-            || view.starts_with("Exact PE 1.1.5 End base-terrain filter complete.")) {
+            || view.starts_with("PE 1.1.5 End terrain filter complete.")) {
             // These are the non-seed status lines printed by this executable,
             // so its stdout can be used directly as the next filter input.
             continue;
@@ -203,7 +205,9 @@ void split_coordinate(
         const std::int32_t world_y = static_cast<std::int32_t>(y);
         const std::int32_t world_z = static_cast<std::int32_t>(z);
         Observation observation{
+            .x = world_x,
             .y = world_y,
+            .z = world_z,
             .end_stone = value == 1,
         };
         const auto key = std::tuple{world_x, world_y, world_z};
@@ -227,9 +231,11 @@ void split_coordinate(
     return observations;
 }
 
-[[nodiscard]] bool matches_base_terrain(
+template <typename MismatchHandler>
+[[nodiscard]] bool visit_observations(
     std::uint32_t seed,
-    const std::vector<Observation>& observations) {
+    const std::vector<Observation>& observations,
+    MismatchHandler&& on_mismatch) {
     end_terrain::Generator generator(seed);
     std::map<std::pair<std::int32_t, std::int32_t>,
         std::array<std::uint8_t, end_terrain::Generator::block_count>> chunks;
@@ -240,7 +246,7 @@ void split_coordinate(
         if (found == chunks.end()) {
             found = chunks.emplace(
                 key,
-                generator.generate_chunk(
+                generator.generate_fresh_visible_chunk(
                     observation.chunk_x, observation.chunk_z)).first;
         }
         const std::size_t block_index =
@@ -248,14 +254,44 @@ void split_coordinate(
                 + static_cast<std::size_t>(observation.local_z))
             * kChunkHeight + static_cast<std::size_t>(observation.y);
         const std::uint8_t block = found->second[block_index];
+        const bool actual_end_stone = block == kPe115EndStoneBlock;
         const bool matches = observation.end_stone
-            ? block == kPe115EndStoneBlock
+            ? actual_end_stone
             : block == kAirBlock;
         if (!matches) {
-            return false;
+            if (!on_mismatch(TerrainMismatch{
+                .x = observation.x,
+                .y = observation.y,
+                .z = observation.z,
+                .expected_end_stone = observation.end_stone,
+                .actual_end_stone = actual_end_stone,
+                .actual_block = block,
+            })) {
+                return false;
+            }
         }
     }
     return true;
+}
+
+[[nodiscard]] bool matches_observations(
+    std::uint32_t seed,
+    const std::vector<Observation>& observations) {
+    return visit_observations(seed, observations,
+        [](const TerrainMismatch&) { return false; });
+}
+
+[[nodiscard]] TerrainVerification verify_observations(
+    std::uint32_t seed,
+    const std::vector<Observation>& observations) {
+    TerrainVerification result;
+    result.observation_count = observations.size();
+    static_cast<void>(visit_observations(seed, observations,
+        [&result](TerrainMismatch mismatch) {
+            result.mismatches.push_back(mismatch);
+            return true;
+        }));
+    return result;
 }
 
 } // namespace
@@ -280,17 +316,15 @@ std::vector<std::uint32_t> filter_files(
     for (std::int64_t index = 0;
          index < static_cast<std::int64_t>(candidates.size());
          ++index) {
-        accepted[static_cast<std::size_t>(index)] = matches_base_terrain(
+        accepted[static_cast<std::size_t>(index)] = matches_observations(
             candidates[static_cast<std::size_t>(index)], observations)
-            ? 1U
-            : 0U;
+            ? 1U : 0U;
     }
 #else
     static_cast<void>(worker_count);
     for (std::size_t index = 0; index < candidates.size(); ++index) {
-        accepted[index] = matches_base_terrain(candidates[index], observations)
-            ? 1U
-            : 0U;
+        accepted[index] = matches_observations(candidates[index], observations)
+            ? 1U : 0U;
     }
 #endif
 
@@ -302,6 +336,12 @@ std::vector<std::uint32_t> filter_files(
         }
     }
     return result;
+}
+
+TerrainVerification verify_file(
+    std::uint32_t seed,
+    const std::string& observation_path) {
+    return verify_observations(seed, load_observations(observation_path));
 }
 
 } // namespace pe115::terrain_filter

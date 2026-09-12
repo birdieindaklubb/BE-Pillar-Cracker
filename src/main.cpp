@@ -5,6 +5,7 @@
 // the observed End-pillar height layout, not a general world generator.
 
 #include "pillar_constraints.hpp"
+#include "pillar_layout.hpp"
 #include "avx2.hpp"
 #include "pe115_end_terrain.hpp"
 #ifdef PE115_HAVE_CUDA
@@ -42,21 +43,7 @@ namespace {
 
 constexpr std::size_t kPillarCount = pe115::kPillarCount;
 constexpr std::size_t kShuffleDrawCount = kPillarCount - 1;
-constexpr std::uint32_t kMtMultiplier = 1'812'433'253U;
-constexpr std::uint32_t kMtUpperMask = 0x8000'0000U;
-constexpr std::uint32_t kMtLowerMask = 0x7fff'ffffU;
-constexpr std::uint32_t kMtMatrixA = 0x9908'b0dfU;
-
-struct PillarSite final {
-    std::int32_t x;
-    std::int32_t z;
-};
-
-// The native PE decorator's fixed End ring, in its shuffle/layout order.
-constexpr std::array<PillarSite, kPillarCount> kPillarSites{{
-    {42, 0}, {33, 24}, {12, 39}, {-12, 39}, {-33, 24},
-    {-42, 0}, {-33, -24}, {-12, -39}, {12, -39}, {33, -24},
-}};
+constexpr const auto& kPillarSites = pe115::pillars::sites;
 
 using Observations = pe115::PillarShapeMasks;
 
@@ -76,6 +63,7 @@ struct Options final {
     std::uint16_t word = 0;
     std::optional<std::uint32_t> verify_seed;
     std::optional<std::pair<std::string, std::string>> terrain_filter_files;
+    std::optional<std::pair<std::uint32_t, std::string>> terrain_verify;
     unsigned int threads = 0;
     bool scalar = false;
     bool avx2_requested = false;
@@ -88,74 +76,6 @@ enum class SelectedBackend {
     avx2,
     cuda,
 };
-
-[[nodiscard]] std::uint32_t temper(std::uint32_t value) noexcept {
-    value ^= value >> 11U;
-    value ^= (value << 7U) & 0x9d2c'5680U;
-    value ^= (value << 15U) & 0xefc6'0000U;
-    value ^= value >> 18U;
-    return value;
-}
-
-[[nodiscard]] std::uint32_t seed_step(
-    std::uint32_t previous,
-    std::uint32_t index) noexcept {
-    return kMtMultiplier * (previous ^ (previous >> 30U)) + index;
-}
-
-// Return precisely the nine values consumed by the PE pillar shuffle.
-//
-// A freshly seeded MT19937 twists before its first output.  The first nine
-// post-twist state words depend only on initial state[0..9] and
-// state[397..405].  Generating that prefix is exactly equivalent to filling
-// and twisting all 624 words, while avoiding the 615 output-state words that
-// this feature can never observe.
-[[nodiscard]] std::array<std::uint32_t, kShuffleDrawCount> mt_prefix(
-    std::uint32_t seed) noexcept {
-    std::array<std::uint32_t, 10> initial_low{};
-    std::array<std::uint32_t, kShuffleDrawCount> initial_high{};
-    initial_low[0] = seed;
-
-    std::uint32_t state_word = seed;
-    for (std::uint32_t index = 1; index <= 405; ++index) {
-        state_word = seed_step(state_word, index);
-        if (index < initial_low.size()) {
-            initial_low[index] = state_word;
-        }
-        if (index >= 397U) {
-            initial_high[index - 397U] = state_word;
-        }
-    }
-
-    std::array<std::uint32_t, kShuffleDrawCount> result{};
-    for (std::size_t index = 0; index < result.size(); ++index) {
-        const std::uint32_t joined =
-            (initial_low[index] & kMtUpperMask)
-            | (initial_low[index + 1] & kMtLowerMask);
-        std::uint32_t twisted = initial_high[index] ^ (joined >> 1U);
-        if ((joined & 1U) != 0U) {
-            twisted ^= kMtMatrixA;
-        }
-        result[index] = temper(twisted);
-    }
-    return result;
-}
-
-[[nodiscard]] std::array<std::uint8_t, kPillarCount> pillar_shapes(
-    std::uint32_t seed) noexcept {
-    std::array<std::uint8_t, kPillarCount> order{};
-    for (std::size_t index = 0; index < order.size(); ++index) {
-        order[index] = static_cast<std::uint8_t>(index);
-    }
-
-    const auto random_values = mt_prefix(seed);
-    for (std::size_t index = 1; index < order.size(); ++index) {
-        const std::size_t selected = random_values[index - 1]
-            % static_cast<std::uint32_t>(index + 1U);
-        std::swap(order[selected], order[index]);
-    }
-    return order;
-}
 
 [[nodiscard]] constexpr std::uint16_t shape_bit(
     std::uint8_t shape) noexcept {
@@ -176,23 +96,13 @@ enum class SelectedBackend {
     return 0U;
 }
 
-[[nodiscard]] constexpr std::uint8_t shape_radius(
-    std::uint8_t shape) noexcept {
-    return static_cast<std::uint8_t>(shape / 3U + 2U);
-}
-
-[[nodiscard]] constexpr bool shape_is_caged(
-    std::uint8_t shape) noexcept {
-    return shape == 1U || shape == 2U;
-}
-
 [[nodiscard]] std::uint16_t radius_mask(std::int32_t radius) {
     if (radius < 2 || radius > 5) {
         throw std::runtime_error("Pillar radius must be 2, 3, 4, or 5.");
     }
     std::uint16_t result = 0U;
     for (std::uint8_t shape = 0U; shape < kPillarCount; ++shape) {
-        if (shape_radius(shape) == radius) {
+        if (pe115::pillars::radius_for_shape(shape) == radius) {
             result = static_cast<std::uint16_t>(result | shape_bit(shape));
         }
     }
@@ -209,7 +119,7 @@ enum class SelectedBackend {
 [[nodiscard]] bool matches(
     std::uint32_t seed,
     const Observations& observations) noexcept {
-    const auto shapes = pillar_shapes(seed);
+    const auto shapes = pe115::pillars::shapes(seed);
     for (std::size_t index = 0; index < shapes.size(); ++index) {
         if ((observations[index] & shape_bit(shapes[index])) == 0U) {
             return false;
@@ -258,7 +168,7 @@ using DrawConstraints = std::array<std::uint8_t, kShuffleDrawCount>;
     initial_low[0] = seed;
     std::uint32_t high_state = seed;
     for (std::uint32_t state_index = 1; state_index <= 397U; ++state_index) {
-        high_state = seed_step(high_state, state_index);
+        high_state = pe115::pillars::seed_step(high_state, state_index);
         if (state_index < initial_low.size()) {
             initial_low[state_index] = high_state;
         }
@@ -266,18 +176,19 @@ using DrawConstraints = std::array<std::uint8_t, kShuffleDrawCount>;
 
     for (std::size_t index = 0; index < draws.size(); ++index) {
         const std::uint32_t joined =
-            (initial_low[index] & kMtUpperMask)
-            | (initial_low[index + 1U] & kMtLowerMask);
+            (initial_low[index] & pe115::pillars::mt_upper_mask)
+            | (initial_low[index + 1U] & pe115::pillars::mt_lower_mask);
         std::uint32_t twisted = high_state ^ (joined >> 1U);
         if ((joined & 1U) != 0U) {
-            twisted ^= kMtMatrixA;
+            twisted ^= pe115::pillars::mt_matrix_a;
         }
-        if (temper(twisted) % static_cast<std::uint32_t>(index + 2U)
+        if (pe115::pillars::temper(twisted)
+            % static_cast<std::uint32_t>(index + 2U)
             != draws[index]) {
             return false;
         }
         if (index + 1U != draws.size()) {
-            high_state = seed_step(
+            high_state = pe115::pillars::seed_step(
                 high_state, static_cast<std::uint32_t>(398U + index));
         }
     }
@@ -597,6 +508,13 @@ void validate_unique_shapes(const Observations& observations) {
                 index, argc, argv, argument);
             const std::string terrain = next_argument(index, argc, argv, argument);
             options.terrain_filter_files = {candidates, terrain};
+        } else if (argument == "--terrain-verify") {
+            if (options.terrain_verify.has_value()) {
+                throw std::runtime_error("--terrain-verify was provided twice.");
+            }
+            const std::uint32_t seed = static_cast<std::uint32_t>(parse_unsigned(
+                next_argument(index, argc, argv, argument), 0xffff'ffffULL, "seed"));
+            options.terrain_verify = {seed, next_argument(index, argc, argv, argument)};
         } else if (argument == "--threads") {
             const auto requested = parse_unsigned(next_argument(
                 index, argc, argv, argument),
@@ -626,7 +544,8 @@ void validate_unique_shapes(const Observations& observations) {
                 << "  --pillar X,Z,H[,R[,CAGED|UNCAGED]]\n"
                 << "  --pillar-top X,Z,TOP[,R[,CAGED|UNCAGED]]\n"
                 << "  --pillar-radius X,Z,R  --pillar-cage X,Z,CAGED|UNCAGED\n\n"
-                << "  pe115_pillarcracker --terrain-filter CANDIDATES.txt TERRAIN.txt\n\n"
+                << "  pe115_pillarcracker --terrain-filter CANDIDATES.txt TERRAIN.txt\n"
+                << "  pe115_pillarcracker --terrain-verify SEED TERRAIN.txt\n\n"
                 << "Heights are feature/crystal-layer Y values 76..103 in steps "
                    "of 3.  --cuda/--avx2 require those backends; --scalar "
                    "disables them.  "
@@ -696,7 +615,7 @@ void validate_unique_shapes(const Observations& observations) {
 }
 
 void print_layout(std::uint32_t seed) {
-    const auto shapes = pillar_shapes(seed);
+    const auto shapes = pe115::pillars::shapes(seed);
     std::cout << "Seed " << seed << " (signed "
               << static_cast<std::int32_t>(seed) << ", "
               << hex_value(seed, 8) << ")\n";
@@ -708,9 +627,11 @@ void print_layout(std::uint32_t seed) {
                   << std::setw(3) << kPillarSites[index].z << ")"
                   << std::setw(12) << height
                   << std::setw(14) << height - 1
-                  << std::setw(8) << static_cast<int>(shape_radius(shapes[index]))
+                  << std::setw(8) << static_cast<int>(
+                         pe115::pillars::radius_for_shape(shapes[index]))
                   << std::setw(7)
-                  << (shape_is_caged(shapes[index]) ? "caged" : "none")
+                  << (pe115::pillars::is_caged_shape(shapes[index])
+                          ? "caged" : "none")
                   << "\n";
     }
 }
@@ -721,14 +642,14 @@ void print_layout(std::uint32_t seed) {
         3'586'334'585U, 545'404'204U, 4'161'255'391U,
         3'922'919'429U, 949'333'985U, 2'715'962'298U,
     }};
-    if (mt_prefix(5489U) != expected) {
+    if (pe115::pillars::shuffle_words(5489U) != expected) {
         std::cerr << "Self-test failed: MT19937 prefix mismatch.\n";
         return false;
     }
 
     constexpr std::uint32_t test_seed = 0x1234'5678U;
     Observations observation{pe115::unconstrained_pillars()};
-    const auto shapes = pillar_shapes(test_seed);
+    const auto shapes = pe115::pillars::shapes(test_seed);
     for (std::size_t index = 0; index < shapes.size(); ++index) {
         observation[index] = shape_bit(shapes[index]);
     }
@@ -750,9 +671,9 @@ void print_layout(std::uint32_t seed) {
     Observations feature_observation{pe115::unconstrained_pillars()};
     for (std::size_t index = 0; index < shapes.size(); ++index) {
         add_radius_constraint(feature_observation, index,
-            shape_radius(shapes[index]));
+            pe115::pillars::radius_for_shape(shapes[index]));
         add_cage_constraint(feature_observation, index,
-            shape_is_caged(shapes[index]));
+            pe115::pillars::is_caged_shape(shapes[index]));
     }
     if (!matches(test_seed, feature_observation)) {
         std::cerr << "Self-test failed: native radius/cage layout rejected.\n";
@@ -1057,15 +978,57 @@ void print_and_save_candidates(
     std::cout << "Saved candidate list: " << path.string() << "\n";
 }
 
+[[nodiscard]] std::string describe_end_block(std::uint8_t block) {
+    if (block == 0U) {
+        return "air";
+    }
+    if (block == 121U) {
+        return "End stone";
+    }
+    return "block " + std::to_string(block);
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
     try {
         Options options = parse_options(argc, argv);
+        if (options.terrain_verify.has_value()) {
+            if (options.terrain_filter_files.has_value()
+                || options.scan_kind != ScanKind::none
+                || options.verify_seed.has_value()
+                || options.self_test
+                || options.scalar
+                || options.avx2_requested
+                || options.cuda_requested
+                || observation_count(options.observations) != 0U) {
+                throw std::runtime_error("--terrain-verify cannot be combined "
+                    "with pillar scanning, --verify, --self-test, "
+                    "--terrain-filter, or a scanner-backend selector.");
+            }
+            const auto& [seed, terrain_path] = *options.terrain_verify;
+            const auto verification = pe115::terrain_filter::verify_file(
+                seed, terrain_path);
+            const std::size_t matches = verification.observation_count
+                - verification.mismatches.size();
+            std::cout << "PE 1.1.5 End terrain verification for unsigned="
+                      << seed << ": " << matches << "/"
+                      << verification.observation_count << " observations match.\n";
+            for (const auto& mismatch : verification.mismatches) {
+                std::cout << "  x=" << mismatch.x << " y=" << mismatch.y
+                          << " z=" << mismatch.z << ": expected "
+                          << (mismatch.expected_end_stone ? "End stone" : "air")
+                          << ", got "
+                          << describe_end_block(mismatch.actual_block)
+                          << ".\n";
+            }
+            return verification.mismatches.empty() ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
         if (options.terrain_filter_files.has_value()) {
             if (options.scan_kind != ScanKind::none
                 || options.verify_seed.has_value()
                 || options.self_test
+                || options.terrain_verify.has_value()
                 || options.scalar
                 || options.avx2_requested
                 || options.cuda_requested
@@ -1078,7 +1041,7 @@ int main(int argc, char* argv[]) {
                 *options.terrain_filter_files;
             const auto candidates = pe115::terrain_filter::filter_files(
                 candidate_path, terrain_path, options.threads);
-            std::cout << "Exact PE 1.1.5 End base-terrain filter complete.\n";
+            std::cout << "PE 1.1.5 End terrain filter complete.\n";
             print_and_save_candidates(candidates, "terrain-filter");
             return EXIT_SUCCESS;
         }
