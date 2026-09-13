@@ -1,8 +1,8 @@
 VIBECODED Pocket Edition / Bedrock Edition end pillar cracker
 
 It searches the 32-bit PE/BE world-seed space from End
-pillar heights, radii, and crystal-cage observations, then can apply exact
-base-End-terrain observations to the resulting candidates.
+pillar heights, radii, and crystal-cage observations, then can apply
+PE 1.1.5 End-terrain observations to the resulting candidates.
 
 ## What it recovers
 
@@ -168,8 +168,10 @@ with:
 ## Exact End-terrain filter
 
 After obtaining a candidate list from the pillar scan, record blocks from the
-unmodified **main End island's base terrain** in a text file. Each non-comment
-line is:
+unmodified, seed-driven End scene in a text file. The filter includes base
+terrain, the first-entry central scene (pillars, exit podium, and arrival
+platform), and the non-city outer-island decorator (outer islands, chorus,
+and natural gateways). Each non-comment line is:
 
 ```text
 x y z value
@@ -193,17 +195,17 @@ unsigned 32-bit decimal seed (or a `0x` hexadecimal bit pattern) per line:
   --terrain-filter .\pillar-candidates.txt .\end-terrain.txt
 ```
 
-The command tests every candidate with its embedded PE 1.1.5 End base-chunk
-generator and prints only the survivors in the same machine-readable
+The command tests every candidate with its embedded PE 1.1.5 final visible
+terrain generator and prints only the survivors in the same machine-readable
 `unsigned=...` form, so filters can be chained. It compares `1` specifically
 to End stone and `0` specifically to air; it does not treat an arbitrary
 non-End-stone block as air.
 
-Only record natural terrain before decoration or player changes. Do not record
-the arrival platform, exit portal, pillars, entities, mined/placed blocks, or
-other non-base-terrain locations: those are not part of this seed-only terrain
-predicate. Terrain observations reduce candidates; they do not change or tune
-the generator.
+Record the initial, unmodified world state. Do not record End City template
+blocks, runtime dragon-fight changes, entities, or mined/placed blocks: they
+are outside this tool's terrain predicate. A `0` must be literal air, not a
+chorus plant, gateway, or another non-air block. Terrain observations reduce
+candidates; they do not change or tune the generator.
 
 ## Exactness boundaries
 
@@ -214,11 +216,13 @@ modulo reduction, and forward shuffle as the target behavior; it does not use
 an approximation or a substitute PRNG.  The optimization is solely avoiding
 the unused remainder of MT19937's 624-word state.
 
-This tool supports PE 1.1.5 pillar candidates and its base-End-terrain filter
-only. It does not claim that pillars alone recover a unique seed, and does not
-support other PE or Java versions.
+This tool supports PE 1.1.5 pillar candidates and its seed-driven End-terrain
+filter only. End City templates, runtime dragon-fight changes, player edits,
+other PE versions, and Java Edition are outside its scope. It does not claim
+that pillars alone recover a unique seed.
 
 The embedded terrain path is deliberately narrow and version-pinned. It uses
 the native source's 3x3x33 density lattice, 8x4x8 interpolation, 16/16/8
-noise-octave construction order, binary32 operation boundaries, and End-stone
-threshold. It is not a terrain heuristic or a Java Edition generator.
+noise-octave construction order, binary32 operation boundaries, End-stone
+threshold, and End decorator sequence. It is not a terrain heuristic or a
+Java Edition generator.

@@ -346,9 +346,12 @@ private:
 class Simplex2d final {
 public:
     explicit Simplex2d(Mt19937& random) noexcept {
-        x_offset_ = fp::mul(random.next_float(), 256.0F);
-        y_offset_ = fp::mul(random.next_float(), 256.0F);
+        // Match the native object layout's Z, Y, X stream order.  The 2-D
+        // End island sampler does not consume these offsets, but retaining
+        // the construction order keeps the standalone state faithful.
         z_offset_ = fp::mul(random.next_float(), 256.0F);
+        y_offset_ = fp::mul(random.next_float(), 256.0F);
+        x_offset_ = fp::mul(random.next_float(), 256.0F);
         for (std::uint32_t index = 0; index < 256U; ++index) {
             permutation_[index] = index;
         }
@@ -1035,7 +1038,7 @@ private:
             if (!chorus_neighbors_are_air(blocks, x, y + offset, z)) {
                 return;
             }
-            blocks.set(x, y + offset, z, 199U);
+            blocks.set(x, y + offset, z, 240U);
         }
 
         bool branched = false;
@@ -1066,7 +1069,7 @@ private:
                     continue;
                 }
                 branched = true;
-                blocks.set(branch_x, branch_y, branch_z, 199U);
+                blocks.set(branch_x, branch_y, branch_z, 240U);
                 grow_chorus(
                     blocks, random, branch_x, branch_y, branch_z, root_x,
                     root_z, spread_limit, layer + 1);
@@ -1084,7 +1087,7 @@ private:
         std::int32_t x,
         std::int32_t y,
         std::int32_t z) {
-        blocks.set(x, y, z, 199U);
+        blocks.set(x, y, z, 240U);
         grow_chorus(blocks, random, x, y, z, x, z, 8, 0);
     }
 
