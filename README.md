@@ -1,5 +1,7 @@
 VIBECODED Pocket Edition / Bedrock Edition end pillar cracker
 
+Small floating islands might not work with terrain filter for now.
+
 It searches the 32-bit PE/BE world-seed space from End
 pillar heights, radii, and crystal-cage observations, then can apply
 PE 1.1.5 End-terrain observations to the resulting candidates.
